@@ -36,23 +36,27 @@ class Secrets
             return substr($value, strlen('bref-ssm:'));
         }, $envVarsToDecrypt);
 
-        $actuallyCalledSsm = false;
-        $parameters = self::readParametersFromCacheOr(function () use ($ssmClient, $ssmNames, &$actuallyCalledSsm) {
-            $actuallyCalledSsm = true;
-            return self::retrieveParametersFromSsm($ssmClient, array_values($ssmNames));
-        });
+        if((bool) getenv('PARAMETERS_SECRETS_EXTENSION_ENABLED') === true) {
+            $parameters = self::retrieveParametersFromSecretsExtension(array_values($ssmNames));
+        } else {
+            $actuallyCalledSsm = false;
+            $parameters = self::readParametersFromCacheOr(function () use ($ssmClient, $ssmNames, &$actuallyCalledSsm) {
+                $actuallyCalledSsm = true;
+                return self::retrieveParametersFromSsm($ssmClient, array_values($ssmNames));
+            });
+
+            // Only log once (when the cache was empty) else it might spam the logs in the function runtime
+            // (where the process restarts on every invocation)
+            if ($actuallyCalledSsm) {
+                $stderr = fopen('php://stderr', 'ab');
+                fwrite($stderr, '[Bref] Loaded these environment variables from SSM: ' . implode(', ', array_keys($envVarsToDecrypt)) . PHP_EOL);
+            }
+        }
 
         foreach ($parameters as $parameterName => $parameterValue) {
             $envVar = array_search($parameterName, $ssmNames, true);
             $_SERVER[$envVar] = $_ENV[$envVar] = $parameterValue;
             putenv("$envVar=$parameterValue");
-        }
-
-        // Only log once (when the cache was empty) else it might spam the logs in the function runtime
-        // (where the process restarts on every invocation)
-        if ($actuallyCalledSsm) {
-            $stderr = fopen('php://stderr', 'ab');
-            fwrite($stderr, '[Bref] Loaded these environment variables from SSM: ' . implode(', ', array_keys($envVarsToDecrypt)) . PHP_EOL);
         }
     }
 
@@ -122,6 +126,62 @@ class Secrets
                 throw $e;
             }
             $parametersNotFound = array_merge($parametersNotFound, $result->getInvalidParameters());
+        }
+
+        if (count($parametersNotFound) > 0) {
+            throw new RuntimeException('The following SSM parameters could not be found: ' . implode(', ', $parametersNotFound));
+        }
+
+        return $parameters;
+    }
+
+    public static function retrieveParametersFromSecretsExtension(array $ssmNames): array
+    {
+        $port = getenv('PARAMETERS_SECRETS_EXTENSION_HTTP_PORT') ?: '2773';
+        $token = getenv('AWS_SESSION_TOKEN');
+
+        $parameters = [];
+        $parametersNotFound = [];
+
+        foreach ($ssmNames as $ssmName) {
+            $url = "http://localhost:{$port}/systemsmanager/parameters/get/?path=" . urlencode($path);
+
+            $options = [
+                'http' => [
+                    'header' => "x-amz-security-token: $token",
+                ],
+            ];
+
+            $context = stream_context_create($options);
+            $result = file_get_contents($url, false, $context);
+
+            if ($result === false || !isset($http_response_header)) {
+                throw new RuntimeException("Failed to retrieve the SSM parameter $ssmName from the local SSM agent.");
+            }
+
+            $status_line = $http_response_header[0];
+            preg_match('{HTTP\/\S*\s(\d{3})}', $status_line, $match);
+            $status_code = $match[1] ?? null;
+
+            if ($status_code != '200') {
+                if ($status_code == '404') {
+                    $parametersNotFound[] = $ssmName;
+                    continue;
+                }
+                if ($status_code == '400') {
+                    throw new RuntimeException("Bref was not able to resolve secrets contained in environment variables from SSM because of a permissions issue with the SSM API. Did you add IAM permissions in serverless.yml to allow Lambda to access SSM? (docs: https://bref.sh/docs/environment/variables.html#at-deployment-time).\nFull exception message: {$result}");
+                }
+
+                throw new RuntimeException("Received HTTP status code $status_code for SSM parameter $ssmName and response $result.");
+            }
+
+            $result = json_decode($result, true);
+
+            if ($result === null) {
+                throw new RuntimeException("Failed to decode the SSM parameter $ssmName from the local SSM agent.");
+            }
+
+            $parameters[$ssmName] = $result['Parameter']['Value'];
         }
 
         if (count($parametersNotFound) > 0) {
